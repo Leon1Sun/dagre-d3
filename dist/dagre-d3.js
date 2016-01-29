@@ -95,7 +95,9 @@ function undirected(parent, id, edge, type) {
 }
 
 },{"./util":25}],3:[function(require,module,exports){
-var util = require("./util");
+var _ = require("./lodash"),
+    addLabel = require("./label/add-label"),
+    util = require("./util");
 
 module.exports = createClusters;
 
@@ -104,11 +106,42 @@ function createClusters(selection, g) {
       svgClusters = selection.selectAll("g.cluster")
         .data(clusters, function(v) { return v; });
 
+  // Clusters created from DOT subgraphs are prefixed with "cluster"
+  // strip this prefix if it exists and use our own (i.e. "cluster_")
+  var makeClusterIdentifier = function(v) {
+    return "cluster_" + v.replace(/^cluster/, "");
+  };
+
   svgClusters.enter()
     .append("g")
-      .attr("class", "cluster")
-      .style("opacity", 0)
-      .append("rect");
+    .attr("class", makeClusterIdentifier)
+    .attr("name", function(v) { return g.node(v).label; })
+    .classed("cluster", true)
+    .style("opacity", 0)
+    .append("rect");
+
+  // Draw the label for each cluster and adjust the padding for it.
+  // We position the labels later because the dimensions and the positions
+  // of the enclosing rectangles are still subject to change. Note that
+  // the ordering here is important because we build the parents' padding
+  // based on the children's.
+  var sortedClusters = util.orderByRank(g, svgClusters.data());
+  for (var i = 0; i < sortedClusters.length; i++) {
+    var v = sortedClusters[i];
+    var node = g.node(v);
+    if (node.label) {
+      var thisGroup = selection.select("g.cluster." + makeClusterIdentifier(v));
+          labelGroup = thisGroup.append("g").attr("class", "label"),
+          labelDom = addLabel(labelGroup, node),
+          bbox = _.pick(labelDom.node().getBBox(), "width", "height");
+      // Add some padding for the label
+      // Do this recursively to account for our descendants' labels.
+      // To avoid double counting, we must start from the leaves.
+      node.paddingTop += bbox.height;
+      node.paddingTop += util.getMaxChildPaddingTop(g, v);
+    }
+  }
+
   util.applyTransition(svgClusters.exit(), g)
     .style("opacity", 0)
     .remove();
@@ -117,19 +150,40 @@ function createClusters(selection, g) {
     .style("opacity", 1);
 
   util.applyTransition(svgClusters.selectAll("rect"), g)
-    .attr("width", function(v) { return g.node(v).width; })
-    .attr("height", function(v) { return g.node(v).height; })
+    .attr("width", function(v) {
+      var node = g.node(v);
+      return node.width + node.paddingLeft + node.paddingRight;
+    })
+    .attr("height", function(v) {
+      var node = g.node(v);
+      return node.height + node.paddingTop + node.paddingBottom;
+    })
     .attr("x", function(v) {
       var node = g.node(v);
-      return node.x - node.width / 2;
+      return node.x - node.width / 2 - node.paddingLeft;
     })
     .attr("y", function(v) {
       var node = g.node(v);
-      return node.y - node.height / 2;
+      return node.y - node.height / 2 - node.paddingTop;
     });
+
+  // Position the labels
+  svgClusters.each(function() {
+    var cluster = d3.select(this),
+        label = cluster.select("g.label"),
+        rect = cluster.select("rect"),
+        bbox = label.node().getBBox(),
+        labelW = bbox.width,
+        labelH = bbox.height;
+    var num = function(x) { return parseFloat(x.toString().replace(/px$/, "")); };
+    var labelX = num(rect.attr("x")) + num(rect.attr("width")) - labelH / 2 + labelW / 2;
+    var labelY = num(rect.attr("y")) + labelH;
+    label.attr("text-anchor", "end")
+      .attr("transform", "translate(" + labelX + "," + labelY + ")");
+  });
 }
 
-},{"./util":25}],4:[function(require,module,exports){
+},{"./label/add-label":18,"./lodash":20,"./util":25}],4:[function(require,module,exports){
 "use strict";
 
 var _ = require("./lodash"),
@@ -258,7 +312,9 @@ function createLine(edge, points) {
 
 function getCoords(elem) {
   var bbox = elem.getBBox(),
-      matrix = elem.getTransformToElement(elem.ownerSVGElement)
+      matrix = elem.ownerSVGElement.getScreenCTM()
+        .inverse()
+        .multiply(elem.getScreenCTM())
         .translate(bbox.width / 2, bbox.height / 2);
   return { x: matrix.e, y: matrix.f };
 }
@@ -317,8 +373,10 @@ function createNodes(selection, g, shapes) {
   svgNodes.selectAll("*").remove();
   svgNodes.enter()
     .append("g")
-      .attr("class", "node")
-      .style("opacity", 0);
+    .attr("class", function(v) { return "node_" + v; })
+    .attr("name", function(v) { return g.node(v).label; })
+    .classed("node", true)
+    .style("opacity", 0);
   svgNodes.each(function(v) {
     var node = g.node(v),
         thisGroup = d3.select(this),
@@ -346,7 +404,27 @@ function createNodes(selection, g, shapes) {
     var shapeSvg = shape(d3.select(this), bbox, node);
     util.applyStyle(shapeSvg, node.style);
 
+    // Stretch this node horizontally a little to account for ancestor cluster
+    // labels. We must do this here because by the time we create the clusters,
+    // we have already positioned all the nodes.
+    var requiredWidth = 0,
+        requiredHeight = 0;
+    var nextNode = g.node(g.parent(v));
+    while (nextNode) {
+      var tempGroup = thisGroup.append("g");
+      var tempLabel = addLabel(tempGroup, nextNode);
+      var tempBBox = tempLabel.node().getBBox();
+      // WARNING: this uses a hard-coded value of nodesep
+      tempBBox.width -= 50;
+      requiredWidth = Math.max(requiredWidth, tempBBox.width);
+      requiredHeight = Math.max(requiredHeight, tempBBox.height);
+      tempLabel.remove();
+      nextNode = g.node(g.parent(nextNode.label));
+    }
+
     var shapeBBox = shapeSvg.node().getBBox();
+    shapeBBox.width = Math.max(shapeBBox.width, requiredWidth);
+    shapeBBox.height = Math.max(shapeBBox.height, requiredHeight);
     node.width = shapeBBox.width;
     node.height = shapeBBox.height;
   });
@@ -868,10 +946,10 @@ function render() {
 }
 
 var NODE_DEFAULT_ATTRS = {
-  paddingLeft: 10,
-  paddingRight: 10,
-  paddingTop: 10,
-  paddingBottom: 10,
+  paddingLeft: 0,
+  paddingRight: 0,
+  paddingTop: 0,
+  paddingBottom: 0,
   rx: 0,
   ry: 0,
   shape: "rect"
@@ -909,6 +987,11 @@ function preProcessGraph(g) {
         paddingBottom: node.padding
       });
     }
+
+    if (_.has(node, "paddingLeft")) { _.defaults(node, { paddingLeft: node.paddingLeft }); }
+    if (_.has(node, "paddingRight")) { _.defaults(node, { paddingRight: node.paddingRight }); }
+    if (_.has(node, "paddingTop")) { _.defaults(node, { paddingTop: node.paddingTop }); }
+    if (_.has(node, "paddingBottom")) { _.defaults(node, { paddingBottom: node.paddingBottom }); }
 
     _.defaults(node, NODE_DEFAULT_ATTRS);
 
@@ -1047,6 +1130,8 @@ var _ = require("./lodash");
 // Public utility functions
 module.exports = {
   isSubgraph: isSubgraph,
+  getMaxChildPaddingTop: getMaxChildPaddingTop,
+  orderByRank: orderByRank,
   edgeToId: edgeToId,
   applyStyle: applyStyle,
   applyClass: applyClass,
@@ -1059,6 +1144,45 @@ module.exports = {
  */
 function isSubgraph(g, v) {
   return !!g.children(v).length;
+}
+
+/*
+ * Returns the max "paddingTop" property among the specified node's children.
+ * A return value of 0 means this node has no children.
+ */
+function getMaxChildPaddingTop(g, v) {
+  var maxPadding = 0;
+  var children = g.children(v);
+  for (var i = 0; i < children.length; i++) {
+    var child = g.node(children[i]);
+    if (child.paddingTop && child.paddingTop > maxPadding) {
+      maxPadding = child.paddingTop;
+    }
+  }
+  return maxPadding;
+}
+
+/* Return the rank of the specified node. A rank of 0 means the node has no children. */
+function getRank(g, v) {
+  var maxRank = 0;
+  var children = g.children(v);
+  for (var i = 0; i < children.length; i++) {
+    var thisRank = getRank(g, children[i]) + 1;
+    if (thisRank > maxRank) {
+      maxRank = thisRank;
+    }
+  }
+  return maxRank;
+}
+
+/*
+ * Order the following nodes by rank, from the leaves to the roots.
+ * This mutates the list of nodes in place while sorting them.
+ */
+function orderByRank(g, nodes) {
+  return nodes.sort(function(x, y) {
+    return getRank(g, x) - getRank(g, y);
+  });
 }
 
 function edgeToId(e) {
@@ -1098,7 +1222,7 @@ function applyTransition(selection, g) {
 }
 
 },{"./lodash":20}],26:[function(require,module,exports){
-module.exports = "0.4.3";
+module.exports = "0.4.4-pre";
 
 },{}],27:[function(require,module,exports){
 /*
@@ -1414,7 +1538,7 @@ function debugOrdering(g) {
 
 },{"./graphlib":33,"./lodash":36,"./util":55}],33:[function(require,module,exports){
 module.exports=require(9)
-},{"/Users/cpettitt/projects/dagre-d3/lib/graphlib.js":9,"graphlib":57}],34:[function(require,module,exports){
+},{"/Users/andrew/Documents/dev/dagre-d3/lib/graphlib.js":9,"graphlib":57}],34:[function(require,module,exports){
 var _ = require("./lodash"),
     Graph = require("./graphlib").Graph,
     List = require("./data/list");
@@ -1930,7 +2054,7 @@ function canonicalize(attrs) {
 
 },{"./acyclic":28,"./add-border-segments":29,"./coordinate-system":30,"./graphlib":33,"./lodash":36,"./nesting-graph":37,"./normalize":38,"./order":43,"./parent-dummy-chains":48,"./position":50,"./rank":52,"./util":55}],36:[function(require,module,exports){
 module.exports=require(20)
-},{"/Users/cpettitt/projects/dagre-d3/lib/lodash.js":20,"lodash":77}],37:[function(require,module,exports){
+},{"/Users/andrew/Documents/dev/dagre-d3/lib/lodash.js":20,"lodash":77}],37:[function(require,module,exports){
 var _ = require("./lodash"),
     util = require("./util");
 
@@ -5101,7 +5225,7 @@ function read(json) {
 
 },{"./graph":72,"./lodash":75}],75:[function(require,module,exports){
 module.exports=require(20)
-},{"/Users/cpettitt/projects/dagre-d3/lib/lodash.js":20,"lodash":77}],76:[function(require,module,exports){
+},{"/Users/andrew/Documents/dev/dagre-d3/lib/lodash.js":20,"lodash":77}],76:[function(require,module,exports){
 module.exports = '1.0.1';
 
 },{}],77:[function(require,module,exports){
